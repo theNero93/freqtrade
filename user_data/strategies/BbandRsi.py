@@ -23,7 +23,7 @@ class BbandRsi(IStrategy):
     # adjust based on market conditions. We would recommend to keep it low for quick turn arounds
     # This attribute will be overridden if the config file contains "minimal_roi"
     minimal_roi = {
-        "0": 0.1
+        "0": 0.07
     }
 
     # Optimal stoploss designed for the strategy
@@ -46,7 +46,7 @@ class BbandRsi(IStrategy):
     def populate_buy_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe.loc[
             (
-                    (dataframe['rsi'] < 30) &
+                    (dataframe['rsi'] < 50) &
                     (dataframe['close'] < dataframe['bb_lowerband'])
 
             ),
@@ -56,7 +56,7 @@ class BbandRsi(IStrategy):
     def populate_sell_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         dataframe.loc[
             (
-                    (dataframe['rsi'] > 70)
+                    (dataframe['rsi'] > 60)
 
             ),
             'sell'] = 1
