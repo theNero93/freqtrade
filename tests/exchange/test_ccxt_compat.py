@@ -5,10 +5,12 @@ However, these tests should give a good idea to determine if a new exchange is
 suitable to run with freqtrade.
 """
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+from freqtrade.exchange import timeframe_to_minutes, timeframe_to_prev_date
 from freqtrade.resolvers.exchange_resolver import ExchangeResolver
 from tests.conftest import get_default_conf
 
@@ -18,7 +20,7 @@ EXCHANGES = {
     'bittrex': {
         'pair': 'BTC/USDT',
         'hasQuoteVolume': False,
-        'timeframe': '5m',
+        'timeframe': '1h',
     },
     'binance': {
         'pair': 'BTC/USDT',
@@ -42,6 +44,7 @@ EXCHANGES = {
 def exchange_conf():
     config = get_default_conf((Path(__file__).parent / "testdata").resolve())
     config['exchange']['pair_whitelist'] = []
+    config['dry_run'] = False
     return config
 
 
@@ -120,7 +123,12 @@ class TestCCXTExchange():
         ohlcv = exchange.refresh_latest_ohlcv([pair_tf])
         assert isinstance(ohlcv, dict)
         assert len(ohlcv[pair_tf]) == len(exchange.klines(pair_tf))
-        assert len(exchange.klines(pair_tf)) > 200
+        # assert len(exchange.klines(pair_tf)) > 200
+        # Assume 90% uptime ...
+        assert len(exchange.klines(pair_tf)) > exchange.ohlcv_candle_limit(timeframe) * 0.90
+        # Check if last-timeframe is within the last 2 intervals
+        now = datetime.now(timezone.utc) - timedelta(minutes=(timeframe_to_minutes(timeframe) * 2))
+        assert exchange.klines(pair_tf).iloc[-1]['date'] >= timeframe_to_prev_date(timeframe, now)
 
     # TODO: tests fetch_trades (?)
 

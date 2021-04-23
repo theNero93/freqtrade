@@ -11,9 +11,11 @@ import uvicorn
 from fastapi import FastAPI
 from fastapi.exceptions import HTTPException
 from fastapi.testclient import TestClient
+from numpy import isnan
 from requests.auth import _basic_auth_str
 
 from freqtrade.__init__ import __version__
+from freqtrade.exceptions import ExchangeError
 from freqtrade.loggers import setup_logging, setup_logging_pre
 from freqtrade.persistence import PairLocks, Trade
 from freqtrade.rpc import RPC
@@ -21,8 +23,8 @@ from freqtrade.rpc.api_server import ApiServer
 from freqtrade.rpc.api_server.api_auth import create_token, get_user_from_token
 from freqtrade.rpc.api_server.uvicorn_threaded import UvicornServer
 from freqtrade.state import RunMode, State
-from tests.conftest import (create_mock_trades, get_patched_freqtradebot, log_has, log_has_re,
-                            patch_get_signal)
+from tests.conftest import (create_mock_trades, get_mock_coro, get_patched_freqtradebot, log_has,
+                            log_has_re, patch_get_signal)
 
 
 BASE_URI = "/api/v1"
@@ -83,9 +85,24 @@ def assert_response(response, expected_code=200, needs_cors=True):
 def test_api_not_found(botclient):
     ftbot, client = botclient
 
-    rc = client_post(client, f"{BASE_URI}/invalid_url")
+    rc = client_get(client, f"{BASE_URI}/invalid_url")
     assert_response(rc, 404)
     assert rc.json() == {"detail": "Not Found"}
+
+
+def test_api_ui_fallback(botclient):
+    ftbot, client = botclient
+
+    rc = client_get(client, "/favicon.ico")
+    assert rc.status_code == 200
+
+    rc = client_get(client, "/fallback_file.html")
+    assert rc.status_code == 200
+    assert '`freqtrade install-ui`' in rc.text
+
+    # Forwarded to fallback_html or index.html (depending if it's installed or not)
+    rc = client_get(client, "/something")
+    assert rc.status_code == 200
 
 
 def test_api_auth():
@@ -213,7 +230,7 @@ def test_api__init__(default_conf, mocker):
     assert apiserver._config == default_conf
 
 
-def test_api_UvicornServer(default_conf, mocker):
+def test_api_UvicornServer(mocker):
     thread_mock = mocker.patch('freqtrade.rpc.api_server.uvicorn_threaded.threading.Thread')
     s = UvicornServer(uvicorn.Config(MagicMock(), port=8080, host='127.0.0.1'))
     assert thread_mock.call_count == 0
@@ -229,6 +246,38 @@ def test_api_UvicornServer(default_conf, mocker):
 
     s.cleanup()
     assert s.should_exit is True
+
+
+def test_api_UvicornServer_run(mocker):
+    serve_mock = mocker.patch('freqtrade.rpc.api_server.uvicorn_threaded.UvicornServer.serve',
+                              get_mock_coro(None))
+    s = UvicornServer(uvicorn.Config(MagicMock(), port=8080, host='127.0.0.1'))
+    assert serve_mock.call_count == 0
+
+    s.install_signal_handlers()
+    # Original implementation starts a thread - make sure that's not the case
+    assert serve_mock.call_count == 0
+
+    # Fake started to avoid sleeping forever
+    s.started = True
+    s.run()
+    assert serve_mock.call_count == 1
+
+
+def test_api_UvicornServer_run_no_uvloop(mocker, import_fails):
+    serve_mock = mocker.patch('freqtrade.rpc.api_server.uvicorn_threaded.UvicornServer.serve',
+                              get_mock_coro(None))
+    s = UvicornServer(uvicorn.Config(MagicMock(), port=8080, host='127.0.0.1'))
+    assert serve_mock.call_count == 0
+
+    s.install_signal_handlers()
+    # Original implementation starts a thread - make sure that's not the case
+    assert serve_mock.call_count == 0
+
+    # Fake started to avoid sleeping forever
+    s.started = True
+    s.run()
+    assert serve_mock.call_count == 1
 
 
 def test_api_run(default_conf, mocker, caplog):
@@ -280,7 +329,7 @@ def test_api_run(default_conf, mocker, caplog):
                    "Please make sure that this is intentional!", caplog)
     assert log_has_re("SECURITY WARNING - `jwt_secret_key` seems to be default.*", caplog)
 
-    # Test crashing flask
+    # Test crashing API server
     caplog.clear()
     mocker.patch('freqtrade.rpc.api_server.webserver.UvicornServer',
                  MagicMock(side_effect=Exception))
@@ -400,6 +449,16 @@ def test_api_locks(botclient):
     assert 'ETH/BTC' in (rc.json()['locks'][0]['pair'], rc.json()['locks'][1]['pair'])
     assert 'randreason' in (rc.json()['locks'][0]['reason'], rc.json()['locks'][1]['reason'])
     assert 'deadbeef' in (rc.json()['locks'][0]['reason'], rc.json()['locks'][1]['reason'])
+
+    # Test deletions
+    rc = client_delete(client, f"{BASE_URI}/locks/1")
+    assert_response(rc)
+    assert rc.json()['lock_count'] == 1
+
+    rc = client_post(client, f"{BASE_URI}/locks/delete",
+                     data='{"pair": "XRP/BTC"}')
+    assert_response(rc)
+    assert rc.json()['lock_count'] == 0
 
 
 def test_api_show_config(botclient, mocker):
@@ -588,7 +647,7 @@ def test_api_profit(botclient, mocker, ticker, fee, markets, limit_buy_order, li
 
     rc = client_get(client, f"{BASE_URI}/profit")
     assert_response(rc)
-    assert rc.json() == {'avg_duration': '0:00:00',
+    assert rc.json() == {'avg_duration': ANY,
                          'best_pair': 'ETH/BTC',
                          'best_rate': 6.2,
                          'first_trade_date': 'just now',
@@ -597,14 +656,12 @@ def test_api_profit(botclient, mocker, ticker, fee, markets, limit_buy_order, li
                          'latest_trade_timestamp': ANY,
                          'profit_all_coin': 6.217e-05,
                          'profit_all_fiat': 0.76748865,
-                         'profit_all_percent': 6.2,
                          'profit_all_percent_mean': 6.2,
                          'profit_all_ratio_mean': 0.06201058,
                          'profit_all_percent_sum': 6.2,
                          'profit_all_ratio_sum': 0.06201058,
                          'profit_closed_coin': 6.217e-05,
                          'profit_closed_fiat': 0.76748865,
-                         'profit_closed_percent': 6.2,
                          'profit_closed_ratio_mean': 0.06201058,
                          'profit_closed_percent_mean': 6.2,
                          'profit_closed_ratio_sum': 0.06201058,
@@ -753,14 +810,12 @@ def test_api_status(botclient, mocker, ticker, fee, markets):
         'stoploss_entry_dist_ratio': -0.10448878,
         'trade_id': 1,
         'close_rate_requested': None,
-        'current_rate': 1.099e-05,
         'fee_close': 0.0025,
         'fee_close_cost': None,
         'fee_close_currency': None,
         'fee_open': 0.0025,
         'fee_open_cost': None,
         'fee_open_currency': None,
-        'open_date': ANY,
         'is_open': True,
         'max_rate': 1.099e-05,
         'min_rate': 1.098e-05,
@@ -773,6 +828,15 @@ def test_api_status(botclient, mocker, ticker, fee, markets):
         'timeframe': 5,
         'exchange': 'bittrex',
     }]
+
+    mocker.patch('freqtrade.freqtradebot.FreqtradeBot.get_sell_rate',
+                 MagicMock(side_effect=ExchangeError("Pair 'ETH/BTC' not available")))
+
+    rc = client_get(client, f"{BASE_URI}/status")
+    assert_response(rc)
+    resp_values = rc.json()
+    assert len(resp_values) == 1
+    assert isnan(resp_values[0]['profit_abs'])
 
 
 def test_api_version(botclient):
@@ -1109,7 +1173,7 @@ def test_list_available_pairs(botclient):
     rc = client_get(client, f"{BASE_URI}/available_pairs")
 
     assert_response(rc)
-    assert rc.json()['length'] == 12
+    assert rc.json()['length'] == 13
     assert isinstance(rc.json()['pairs'], list)
 
     rc = client_get(client, f"{BASE_URI}/available_pairs?timeframe=5m")

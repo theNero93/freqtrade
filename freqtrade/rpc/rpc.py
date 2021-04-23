@@ -3,13 +3,13 @@ This module contains class to define a RPC communications
 """
 import logging
 from abc import abstractmethod
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from enum import Enum
 from math import isnan
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import arrow
-from numpy import NAN, int64, mean
+from numpy import NAN, inf, int64, mean
 from pandas import DataFrame
 
 from freqtrade.configuration.timerange import TimeRange
@@ -20,6 +20,7 @@ from freqtrade.exchange import timeframe_to_minutes, timeframe_to_msecs
 from freqtrade.loggers import bufferHandler
 from freqtrade.misc import shorten_date
 from freqtrade.persistence import PairLocks, Trade
+from freqtrade.persistence.models import PairLock
 from freqtrade.plugins.pairlist.pairlist_helpers import expand_pairlist
 from freqtrade.rpc.fiat_convert import CryptoToFiatConverter
 from freqtrade.state import State
@@ -129,6 +130,7 @@ class RPC:
             'trailing_stop_positive': config.get('trailing_stop_positive'),
             'trailing_stop_positive_offset': config.get('trailing_stop_positive_offset'),
             'trailing_only_offset_is_reached': config.get('trailing_only_offset_is_reached'),
+            'use_custom_stoploss': config.get('use_custom_stoploss'),
             'bot_name': config.get('bot_name', 'freqtrade'),
             'timeframe': config.get('timeframe'),
             'timeframe_ms': timeframe_to_msecs(config['timeframe']
@@ -287,9 +289,10 @@ class RPC:
         """ Returns the X last trades """
         if limit > 0:
             trades = Trade.get_trades([Trade.is_open.is_(False)]).order_by(
-                Trade.id.desc()).limit(limit)
+                Trade.close_date.desc()).limit(limit)
         else:
-            trades = Trade.get_trades([Trade.is_open.is_(False)]).order_by(Trade.id.desc()).all()
+            trades = Trade.get_trades([Trade.is_open.is_(False)]).order_by(
+                Trade.close_date.desc()).all()
 
         output = [trade.to_json() for trade in trades]
 
@@ -377,7 +380,7 @@ class RPC:
 
         # Prepare data to display
         profit_closed_coin_sum = round(sum(profit_closed_coin), 8)
-        profit_closed_ratio_mean = mean(profit_closed_ratio) if profit_closed_ratio else 0.0
+        profit_closed_ratio_mean = float(mean(profit_closed_ratio) if profit_closed_ratio else 0.0)
         profit_closed_ratio_sum = sum(profit_closed_ratio) if profit_closed_ratio else 0.0
 
         profit_closed_fiat = self._fiat_converter.convert_amount(
@@ -387,7 +390,7 @@ class RPC:
         ) if self._fiat_converter else 0
 
         profit_all_coin_sum = round(sum(profit_all_coin), 8)
-        profit_all_ratio_mean = mean(profit_all_ratio) if profit_all_ratio else 0.0
+        profit_all_ratio_mean = float(mean(profit_all_ratio) if profit_all_ratio else 0.0)
         profit_all_ratio_sum = sum(profit_all_ratio) if profit_all_ratio else 0.0
         profit_all_fiat = self._fiat_converter.convert_amount(
             profit_all_coin_sum,
@@ -400,14 +403,12 @@ class RPC:
         num = float(len(durations) or 1)
         return {
             'profit_closed_coin': profit_closed_coin_sum,
-            'profit_closed_percent': round(profit_closed_ratio_mean * 100, 2),  # DEPRECATED
             'profit_closed_percent_mean': round(profit_closed_ratio_mean * 100, 2),
             'profit_closed_ratio_mean': profit_closed_ratio_mean,
             'profit_closed_percent_sum': round(profit_closed_ratio_sum * 100, 2),
             'profit_closed_ratio_sum': profit_closed_ratio_sum,
             'profit_closed_fiat': profit_closed_fiat,
             'profit_all_coin': profit_all_coin_sum,
-            'profit_all_percent': round(profit_all_ratio_mean * 100, 2),  # DEPRECATED
             'profit_all_percent_mean': round(profit_all_ratio_mean * 100, 2),
             'profit_all_ratio_mean': profit_all_ratio_mean,
             'profit_all_percent_sum': round(profit_all_ratio_sum * 100, 2),
@@ -450,7 +451,7 @@ class RPC:
                     pair = self._freqtrade.exchange.get_valid_pair_combination(coin, stake_currency)
                     rate = tickers.get(pair, {}).get('bid', None)
                     if rate:
-                        if pair.startswith(stake_currency):
+                        if pair.startswith(stake_currency) and not pair.endswith(stake_currency):
                             rate = 1.0 / rate
                         est_stake = rate * balance.total
                 except (ExchangeError):
@@ -589,10 +590,11 @@ class RPC:
             raise RPCException(f'position for {pair} already open - id: {trade.id}')
 
         # gen stake amount
-        stakeamount = self._freqtrade.get_trade_stake_amount(pair)
+        stakeamount = self._freqtrade.wallets.get_trade_stake_amount(
+            pair, self._freqtrade.get_free_open_trades())
 
         # execute buy
-        if self._freqtrade.execute_buy(pair, stakeamount, price):
+        if self._freqtrade.execute_buy(pair, stakeamount, price, forcebuy=True):
             trade = Trade.get_trades([Trade.is_open.is_(True), Trade.pair == pair]).first()
             return trade
         else:
@@ -661,13 +663,32 @@ class RPC:
         }
 
     def _rpc_locks(self) -> Dict[str, Any]:
-        """ Returns the  current locks"""
+        """ Returns the  current locks """
 
         locks = PairLocks.get_pair_locks(None)
         return {
             'lock_count': len(locks),
             'locks': [lock.to_json() for lock in locks]
         }
+
+    def _rpc_delete_lock(self, lockid: Optional[int] = None,
+                         pair: Optional[str] = None) -> Dict[str, Any]:
+        """ Delete specific lock(s) """
+        locks = []
+
+        if pair:
+            locks = PairLocks.get_pair_locks(pair)
+        if lockid:
+            locks = PairLock.query.filter(PairLock.id == lockid).all()
+
+        for lock in locks:
+            lock.active = False
+            lock.lock_end_time = datetime.now(timezone.utc)
+
+        # session is always the same
+        PairLock.session.flush()
+
+        return self._rpc_locks()
 
     def _rpc_whitelist(self) -> Dict:
         """ Returns the currently active whitelist"""
@@ -745,6 +766,7 @@ class RPC:
                 sell_mask = (dataframe['sell'] == 1)
                 sell_signals = int(sell_mask.sum())
                 dataframe.loc[sell_mask, '_sell_signal_open'] = dataframe.loc[sell_mask, 'open']
+            dataframe = dataframe.replace([inf, -inf], NAN)
             dataframe = dataframe.replace({NAN: None})
 
         res = {
@@ -773,7 +795,8 @@ class RPC:
             })
         return res
 
-    def _rpc_analysed_dataframe(self, pair: str, timeframe: str, limit: int) -> Dict[str, Any]:
+    def _rpc_analysed_dataframe(self, pair: str, timeframe: str,
+                                limit: Optional[int]) -> Dict[str, Any]:
 
         _data, last_analyzed = self._freqtrade.dataprovider.get_analyzed_dataframe(
             pair, timeframe)
